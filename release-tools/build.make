@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: build-% build container-% container push-% push clean test
+.PHONY: build-% debug-build-% build debug-build container-% debug-container-% container debug-container push-% push clean test
 
 # A space-separated list of all commands in the repository, must be
 # set in main Makefile of a repository.
@@ -64,6 +64,13 @@ build-%:
 	mkdir -p bin
 	CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-X main.version=$(REV) -extldflags "-static"' -o ./bin/$* ./cmd/$*
 
+debug-build-%:
+	mkdir -p debug-bin
+	CGO_ENABLED=0 GOOS=linux go build -a -gcflags "all=-N -l" -ldflags '-X main.version=$(REV) -extldflags "-static"' -o ./debug-bin/$* ./cmd/$*
+
+debug-container-%: debug-build-%
+	docker build -t $*:debug -f $(shell if [ -e ./cmd/$*/Dockerfile.debug ]; then echo ./cmd/$*/Dockerfile.debug; else echo Dockerfile.debug; fi) --label revision=$(REV) .
+
 container-%: build-%
 	docker build -t $*:latest -f $(shell if [ -e ./cmd/$*/Dockerfile ]; then echo ./cmd/$*/Dockerfile; else echo Dockerfile; fi) --label revision=$(REV) .
 
@@ -86,11 +93,13 @@ push-%: container-%
 	done
 
 build: $(CMDS:%=build-%)
+debug-build: $(CMDS:%=debug-build-%)
 container: $(CMDS:%=container-%)
+debug-container: $(CMDS:%=debug-container-%)
 push: $(CMDS:%=push-%)
 
 clean:
-	-rm -rf bin
+	-rm -rf bin debug-bin
 
 test:
 

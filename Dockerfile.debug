@@ -1,0 +1,21 @@
+FROM centos:centos7
+LABEL maintainers="Kubernetes Authors"
+LABEL description="Image Driver"
+
+RUN \
+  yum groupinstall -y "Development Tools" && \
+  yum install -y epel-release && \
+  yum install -y golang buildah && \
+  yum clean all
+
+RUN mkdir -p /go && chmod -R 777 /go
+ENV GOPATH=/go
+RUN go get -u github.com/go-delve/delve/cmd/dlv
+
+RUN git clone https://github.com/rexray/gocsi.git /root/gocsi && cd /root/gocsi && make
+
+COPY ./debug-bin/imagepopulatorplugin /imagepopulatorplugin
+
+EXPOSE 2345
+ENTRYPOINT ["/go/bin/dlv", "--listen=:2345", "--headless=true", "--api-version=2", "--accept-multiclient", "exec", "/imagepopulatorplugin", "--"]
+
