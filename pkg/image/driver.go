@@ -24,10 +24,10 @@ import (
 )
 
 type driver struct {
-	csiDriver *csicommon.CSIDriver
-	endpoint  string
+	csiDriver  *csicommon.CSIDriver
+	driverName string
+	endpoint   string
 
-	ids *csicommon.DefaultIdentityServer
 	ns  *nodeServer
 
 	cap   []*csi.VolumeCapability_AccessMode
@@ -41,31 +41,27 @@ var (
 func NewDriver(driverName, nodeID, endpoint string) *driver {
 	glog.Infof("Driver: %v version: %v", driverName, version)
 
-	d := &driver{}
+	d := &driver{
+		driverName: driverName,
+		endpoint: endpoint,
+		csiDriver: csicommon.NewCSIDriver(driverName, version, nodeID),
+	}
 
-	d.endpoint = endpoint
-
-	csiDriver := csicommon.NewCSIDriver(driverName, version, nodeID)
-	csiDriver.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER})
+	d.csiDriver.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER})
 	// image plugin does not support ControllerServiceCapability now.
 	// If support is added, it should set to appropriate
 	// ControllerServiceCapability RPC types.
-	csiDriver.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{csi.ControllerServiceCapability_RPC_UNKNOWN})
+	d.csiDriver.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{csi.ControllerServiceCapability_RPC_UNKNOWN})
 
-	d.csiDriver = csiDriver
-
+	d.ns = NewNodeServer(d)
 	return d
 }
 
 func NewNodeServer(d *driver) *nodeServer {
 	return &nodeServer{
 		DefaultNodeServer: csicommon.NewDefaultNodeServer(d.csiDriver),
-	}
-}
-
-func NewControllerServer(d *csicommon.CSIDriver) *controllerServer {
-	return &controllerServer{
-		DefaultControllerServer: csicommon.NewDefaultControllerServer(d),
+		buildah:          &buildah{ driverName: d.driverName, execPath: "/bin/buildah" },
+		volumeStatuses:    map[string]*volumeStatus{},
 	}
 }
 
@@ -73,7 +69,7 @@ func (d *driver) Run() {
 	s := csicommon.NewNonBlockingGRPCServer()
 	s.Start(d.endpoint,
 		csicommon.NewDefaultIdentityServer(d.csiDriver),
-		NewControllerServer(d.csiDriver),
-		NewNodeServer(d))
+		csicommon.NewDefaultControllerServer(d.csiDriver),
+		d.ns)
 	s.Wait()
 }

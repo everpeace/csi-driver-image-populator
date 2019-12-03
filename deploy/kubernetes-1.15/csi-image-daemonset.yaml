@@ -38,6 +38,9 @@ spec:
 
         - name: image
           image: quay.io/k8scsi/imagepopulatorplugin:canary
+#          image: quay.io/k8scsi/imagepopulatorplugin:debug
+#          ports:
+#            - containerPort: 2345
           args:
             - "--v=5"
             - "--endpoint=$(CSI_ENDPOINT)"

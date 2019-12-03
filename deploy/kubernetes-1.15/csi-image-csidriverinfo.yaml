@@ -4,4 +4,4 @@ metadata:
   name: image.csi.k8s.io
 spec:
   attachRequired: false
-  podInfoOnMount: false
+  podInfoOnMount: true

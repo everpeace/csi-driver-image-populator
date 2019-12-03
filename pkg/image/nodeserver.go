@@ -18,183 +18,269 @@ package image
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"strings"
-	"time"
-
 	"github.com/golang/glog"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	"strconv"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/kubernetes/pkg/util/mount"
 
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
 
-const (
-	deviceID = "deviceID"
-)
-
-var (
-	TimeoutError = fmt.Errorf("Timeout")
-)
-
+// TODO implement GC
 type nodeServer struct {
 	*csicommon.DefaultNodeServer
-	Timeout  time.Duration
-	execPath string
-	args     []string
+	driverName     string
+	buildah        *buildah
+	volumeStatuses map[string]*volumeStatus
+}
+
+type volumePhase string
+
+var (
+	// publish states
+	volumePhaseInitState         volumePhase = "InitState"
+	volumePhaseContainerCreated  volumePhase = "ContainerCreated"
+	volumePhaseContainerMounted  volumePhase = "ContainerMounted"
+	volumePhaseTargetPathMounted volumePhase = "TargetPathMounted"
+	volumePhasePublished         volumePhase = "Published"
+
+	// unpublish states
+	volumePhaseTargetPathUnMounted  volumePhase = "TargetPathUnMounted"
+	volumePhaseContainerCommitted   volumePhase = "ContainerCommitted"
+	volumePhaseContainerUnMounted   volumePhase = "ContainerUnMounted"
+	volumePhaseContainerImagePushed volumePhase = "ContainerImagePushed"
+	volumePhaseCnotainerDeleted     volumePhase = "ContainerDeleted"
+	volumePhaseUnPublished          volumePhase = "UnPublished"
+)
+
+type volumeStatus struct {
+	config          *volumeConfig
+	phase           volumePhase
+	provisionedRoot string
+}
+
+type volumeConfig struct {
+	dockerConfigJson  string
+	image             string
+	postPublish       bool
+	postPublishImage  string
+	postPublishSquash bool
+}
+
+func (ns *nodeServer) initVolumeStatus(volumeId string, config *volumeConfig) error {
+	if st, ok := ns.volumeStatuses[volumeId]; ok {
+		return fmt.Errorf("volumeId=%s has not been fully unpublished. volumePhase=%s", volumeId, st.phase)
+	}
+	ns.volumeStatuses[volumeId] = &volumeStatus{
+		config: config,
+		phase:  volumePhaseInitState,
+	}
+	return nil
+}
+
+func (ns *nodeServer) deleteVolumeStatus(volumeId string) {
+	if _, ok := ns.volumeStatuses[volumeId]; ok {
+		delete(ns.volumeStatuses, volumeId)
+	}
+}
+
+func (ns *nodeServer) getVolumeStatus(volumeId string) *volumeStatus {
+	return ns.volumeStatuses[volumeId]
 }
 
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-
 	// Check arguments
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
 	}
-	if len(req.GetVolumeId()) == 0 {
+	volumeId := req.GetVolumeId()
+	if volumeId == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
-	if len(req.GetTargetPath()) == 0 {
+	targetPath := req.GetTargetPath()
+	if targetPath == "" {
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 
-	image := req.GetVolumeContext()["image"]
-
-	err := ns.setupVolume(req.GetVolumeId(), image)
+	// initialize volume status
+	volConfig, err := getVolumeConfig(req)
 	if err != nil {
-		return nil, err
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := ns.initVolumeStatus(volumeId, volConfig); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	targetPath := req.GetTargetPath()
-	notMnt, err := mount.New("").IsLikelyNotMountPoint(targetPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if err = os.MkdirAll(targetPath, 0750); err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			notMnt = true
-		} else {
+	// publish
+	if err := ns.publishVolume(ctx, req, volumeId); err != nil {
+		glog.Errorf("publishing volume(%s) failed: %s", volumeId, err.Error())
+		glog.Error("rolling back the publish process")
+		if errRollback := ns.rollbackPublishVolume(ctx, req, volumeId); errRollback != nil {
+			glog.Errorf("rolling back publishing volume(%s) process failed: %s", volumeId, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
 		}
-	}
-
-	if !notMnt {
-		return &csi.NodePublishVolumeResponse{}, nil
-	}
-
-	fsType := req.GetVolumeCapability().GetMount().GetFsType()
-
-	deviceId := ""
-	if req.GetPublishContext() != nil {
-		deviceId = req.GetPublishContext()[deviceID]
-	}
-
-	readOnly := req.GetReadonly()
-	volumeId := req.GetVolumeId()
-	attrib := req.GetVolumeContext()
-	mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
-
-	glog.V(4).Infof("target %v\nfstype %v\ndevice %v\nreadonly %v\nvolumeId %v\nattributes %v\n mountflags %v\n",
-		targetPath, fsType, deviceId, readOnly, volumeId, attrib, mountFlags)
-
-	options := []string{"bind"}
-	if readOnly {
-		options = append(options, "ro")
-	}
-
-	args := []string{"mount", volumeId}
-	ns.execPath = "/bin/buildah" // FIXME
-	output, err := ns.runCmd(args)
-	// FIXME handle failure.
-	provisionRoot := strings.TrimSpace(string(output[:]))
-	glog.V(4).Infof("container mount point at %s\n", provisionRoot)
-
-	mounter := mount.New("")
-	path := provisionRoot
-	if err := mounter.Mount(path, targetPath, "", options); err != nil {
-		return nil, err
+		ns.deleteVolumeStatus(volumeId)
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (ns *nodeServer) publishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeId string) error {
+	volStatus := ns.getVolumeStatus(volumeId)
+	if volStatus == nil {
+		return errors.Errorf("volumeId=%s is not initialized", volumeId)
+	}
 
+	switch volStatus.phase {
+	case volumePhaseInitState:
+		isExist, err := ns.buildah.isContainerExist(volumeId)
+		if err != nil {
+			return errors.Wrapf(err, "check buildah container(name=%s) existence failed", volumeId)
+		}
+		if isExist {
+			volStatus.phase = volumePhaseContainerCreated
+			return ns.publishVolume(ctx, req, volumeId)
+		}
+		if err := ns.buildah.from(volumeId, volStatus.config.image, volStatus.config.dockerConfigJson); err != nil {
+			return errors.Wrapf(err, "can't create buildah container(name=%s)", volumeId)
+		}
+		volStatus.phase = volumePhaseContainerCreated
+		return ns.publishVolume(ctx, req, volumeId)
+	case volumePhaseContainerCreated:
+		provisionRoot, err := ns.buildah.mount(volumeId)
+		if err != nil {
+			return errors.Wrapf(err, "can't mount buildah container(name=%s)", volumeId)
+		}
+		volStatus.provisionedRoot = provisionRoot
+		volStatus.phase = volumePhaseContainerMounted
+		return ns.publishVolume(ctx, req, volumeId)
+	case volumePhaseContainerMounted:
+		readOnly := req.GetReadonly()
+		options := []string{"bind"}
+		if readOnly {
+			options = append(options, "ro")
+		}
+		if err := mountTargetPath(volStatus.provisionedRoot, req.GetTargetPath(), options); err != nil {
+			return errors.Wrapf(err,
+				"can't mount buildah container(name=%s)'s provisioned root(=%s) to volume targetPath(=%s)",
+				volumeId, volStatus.provisionedRoot, req.GetTargetPath(),
+			)
+		}
+		volStatus.phase = volumePhaseTargetPathMounted
+		return ns.publishVolume(ctx, req, volumeId)
+	case volumePhaseTargetPathMounted:
+		volStatus.phase = volumePhasePublished
+		return ns.publishVolume(ctx, req, volumeId)
+	case volumePhasePublished:
+		return nil
+	default:
+		return errors.Errorf("internal error in publishVolume. volumeId=%s, volumePhase=%s", volumeId, volStatus.phase)
+	}
+}
+
+func (ns *nodeServer) rollbackPublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest, volumeId string) error {
+	volStatus := ns.getVolumeStatus(volumeId)
+	if volStatus == nil {
+		return errors.Errorf("volumeId=%s is not initialized", volumeId)
+	}
+	switch volStatus.phase {
+	case volumePhaseInitState:
+		return nil
+	case volumePhaseContainerCreated:
+		if err := ns.buildah.delete(volumeId); err != nil {
+			return errors.Wrapf(err, "can't delete buildah container(name=%s)", volumeId)
+		}
+		volStatus.phase = volumePhaseInitState
+		return ns.rollbackPublishVolume(ctx, req, volumeId)
+	case volumePhaseContainerMounted:
+		if err := ns.buildah.umount(volumeId); err != nil {
+			return errors.Wrapf(err, "can't umount buildah container(name=%s)", volumeId)
+		}
+		volStatus.phase = volumePhaseContainerCreated
+		return ns.rollbackPublishVolume(ctx, req, volumeId)
+	case volumePhaseTargetPathMounted:
+		if err := unmountTargetPath(req.GetTargetPath()); err != nil {
+			return errors.Wrapf(err, "can't unmount volume(volumeId=%s) targetPath(=%s)", volumeId, req.GetTargetPath())
+		}
+		volStatus.phase = volumePhaseContainerMounted
+		return ns.rollbackPublishVolume(ctx, req, volumeId)
+	default:
+		return errors.Errorf("internal error in rollbackPublishVolume. volumeId=%s, volumePhase=%s", volumeId, volStatus.phase)
+	}
+}
+
+func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	// Check arguments
-	if len(req.GetVolumeId()) == 0 {
+	volumeId := req.GetVolumeId()
+	if len(volumeId) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 	if len(req.GetTargetPath()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
-	targetPath := req.GetTargetPath()
-	volumeId := req.GetVolumeId()
 
-	// Unmounting the image
-	err := mount.New("").Unmount(req.GetTargetPath())
-	if err != nil {
+	if err := ns.unPublishVolume(ctx, req, volumeId); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	glog.V(4).Infof("image: volume %s/%s has been unmounted.", targetPath, volumeId)
 
-	err = ns.unsetupVolume(volumeId)
-	if err != nil {
-		return nil, err
-	}
+	ns.deleteVolumeStatus(volumeId)
+
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) setupVolume(volumeId string, image string) error {
-
-	args := []string{"from", "--name", volumeId, "--pull", image}
-	ns.execPath = "/bin/buildah" // FIXME
-	output, err := ns.runCmd(args)
-	// FIXME handle failure.
-	// FIXME handle already deleted.
-	provisionRoot := strings.TrimSpace(string(output[:]))
-	// FIXME remove
-	glog.V(4).Infof("container mount point at %s\n", provisionRoot)
-	return err
-}
-
-func (ns *nodeServer) unsetupVolume(volumeId string) error {
-
-	args := []string{"delete", volumeId}
-	ns.execPath = "/bin/buildah" // FIXME
-	output, err := ns.runCmd(args)
-	// FIXME handle failure.
-	// FIXME handle already deleted.
-	provisionRoot := strings.TrimSpace(string(output[:]))
-	// FIXME remove
-	glog.V(4).Infof("container mount point at %s\n", provisionRoot)
-	return err
-}
-
-func (ns *nodeServer) runCmd(args []string) ([]byte, error) {
-	execPath := ns.execPath
-
-	cmd := exec.Command(execPath, args...)
-
-	timeout := false
-	if ns.Timeout > 0 {
-		timer := time.AfterFunc(ns.Timeout, func() {
-			timeout = true
-			// TODO: cmd.Stop()
-		})
-		defer timer.Stop()
+func (ns *nodeServer) unPublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, volumeId string) error {
+	volStatus := ns.getVolumeStatus(volumeId)
+	if volStatus == nil {
+		return errors.Errorf("volumeId=%s is not initialized", volumeId)
 	}
-
-	output, execErr := cmd.CombinedOutput()
-	if execErr != nil {
-		if timeout {
-			return nil, TimeoutError
+	switch volStatus.phase {
+	case volumePhasePublished:
+		if err := unmountTargetPath(req.GetTargetPath()); err != nil {
+			return errors.Wrapf(err, "can't unmount volume(volumeId=%s) targetPath(=%s)", volumeId, req.GetTargetPath())
 		}
+		volStatus.phase = volumePhaseTargetPathUnMounted
+		return ns.unPublishVolume(ctx, req, volumeId)
+	case volumePhaseTargetPathUnMounted:
+		if !volStatus.config.postPublish {
+			volStatus.phase = volumePhaseContainerImagePushed
+			return ns.unPublishVolume(ctx, req, volumeId)
+		}
+		if err := ns.buildah.commit(req.GetVolumeId(), volStatus.config.postPublishImage, volStatus.config.postPublishSquash); err != nil {
+			return errors.Wrapf(err, "can't commit buildah container(name=%s)", volumeId)
+		}
+		volStatus.phase = volumePhaseContainerCommitted
+		return ns.unPublishVolume(ctx, req, volumeId)
+	case volumePhaseContainerCommitted:
+		if err := ns.buildah.umount(req.GetVolumeId()); err != nil {
+			return errors.Wrapf(err, "can't umount buildah container(name=%s)", volumeId)
+		}
+		volStatus.phase = volumePhaseContainerUnMounted
+		return ns.unPublishVolume(ctx, req, volumeId)
+	case volumePhaseContainerUnMounted:
+		if err := ns.buildah.push(req.GetVolumeId(), volStatus.config.postPublishImage, volStatus.config.dockerConfigJson); err != nil {
+			return errors.Wrapf(err, "can't push image(=%s)", volStatus.config.postPublishImage)
+		}
+		volStatus.phase = volumePhaseContainerImagePushed
+		return ns.unPublishVolume(ctx, req, volumeId)
+	case volumePhaseContainerImagePushed:
+		if err := ns.buildah.delete(req.GetVolumeId()); err != nil {
+			return errors.Wrapf(err, "can't delete buildah container(name=%s)", volumeId)
+		}
+		volStatus.phase = volumePhaseCnotainerDeleted
+		return ns.unPublishVolume(ctx, req, volumeId)
+	case volumePhaseCnotainerDeleted:
+		volStatus.phase = volumePhaseUnPublished
+		return ns.unPublishVolume(ctx, req, volumeId)
+	case volumePhaseUnPublished:
+		return nil
+	default:
+		return errors.Errorf("internal error in unPublishVolume. volumeId=%s, volumePhase=%s", volumeId, volStatus.phase)
 	}
-	return output, execErr
 }
 
 func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
@@ -203,4 +289,49 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+func getVolumeConfig(req *csi.NodePublishVolumeRequest) (*volumeConfig, error) {
+	volumeContext := req.GetVolumeContext()
+	secrets := req.GetSecrets()
+
+	volumeConfig := &volumeConfig{}
+
+	if len(secrets) > 0 {
+		dockerConfigJson, ok := secrets[".dockerconfigjson"]
+		if !ok {
+			return nil, errors.New("specified secret must have key='.dockerconfigjson'")
+		}
+		volumeConfig.dockerConfigJson = dockerConfigJson
+	}
+
+	image, ok := volumeContext["image"]
+	if !ok {
+		return nil, errors.New("it must specify image")
+	}
+	volumeConfig.image = image
+
+	if postPublish, ok := volumeContext["post-publish"]; ok {
+		b, err := strconv.ParseBool(postPublish)
+		if err != nil {
+			return nil, errors.New("post-publish must be boolean string")
+		}
+		volumeConfig.postPublish = b
+	}
+
+	postPublishImage, ok := volumeContext["post-publish-image"]
+	if volumeConfig.postPublish && !ok {
+		return nil, errors.New("post-publish-image must be specified when post-publish is true")
+	}
+	volumeConfig.postPublishImage = postPublishImage
+
+	if postPublishSquash, ok := volumeContext["post-publish-squash"]; ok {
+		b, err := strconv.ParseBool(postPublishSquash)
+		if err != nil {
+			return nil, errors.New("post-publish-squash must be boolean string")
+		}
+		volumeConfig.postPublishSquash = b
+	}
+
+	return volumeConfig, nil
 }

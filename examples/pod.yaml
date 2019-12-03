@@ -5,7 +5,8 @@ metadata:
 spec:
   containers:
   - name: main
-    image: nginx
+    image: busybox
+    command: ["sleep","65535"]
     volumeMounts:
     - name: data
       mountPath: /var/www/html
@@ -13,8 +14,13 @@ spec:
   - name: data
     csi:
       driver: image.csi.k8s.io
+      nodePublishSecretRef:
+        name: dockercred
       volumeAttributes:
         # Specify your image here. busybox used just as a placeholder, not
         # because its a good idea. See the container folder for a better
         # example.
         image: busybox
+        post-publish: "true"
+        post-publish-image: everpeace/misc:busybox-v2
+        post-publish-squash: "false"

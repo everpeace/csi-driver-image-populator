@@ -34,14 +34,6 @@
   version = "v1.2.0"
 
 [[projects]]
-  digest = "1:3a26588bc48b96825977c1b3df964f8fd842cd6860cc26370588d3563433cf11"
-  name = "github.com/google/uuid"
-  packages = ["."]
-  pruneopts = "UT"
-  revision = "d460ce9f8df2e77fb1ba55ca87fafed96c607494"
-  version = "v1.0.0"
-
-[[projects]]
   digest = "1:596505ce72821ef663980f7ce826984a30da406f9356a92c10ac8b44012d549c"
   name = "github.com/kubernetes-csi/drivers"
   packages = ["pkg/csi-common"]
@@ -50,12 +42,12 @@
   version = "v1.0.0"
 
 [[projects]]
-  digest = "1:e5d0bd87abc2781d14e274807a470acd180f0499f8bf5bb18606e9ec22ad9de9"
-  name = "github.com/pborman/uuid"
+  digest = "1:cf31692c14422fa27c83a05292eb5cbe0fb2775972e8f1f8446a71549bd8980b"
+  name = "github.com/pkg/errors"
   packages = ["."]
   pruneopts = "UT"
-  revision = "adf5a7427709b9deb95d29d3fa8a2bf9cfd388f1"
-  version = "v1.2"
+  revision = "ba968bfe8b2f7e042a574c888954fccecfa385b4"
+  version = "v0.8.1"
 
 [[projects]]
   branch = "master"
@@ -182,15 +174,12 @@
   input-imports = [
     "github.com/container-storage-interface/spec/lib/go/csi",
     "github.com/golang/glog",
-    "github.com/golang/protobuf/ptypes",
-    "github.com/golang/protobuf/ptypes/timestamp",
     "github.com/kubernetes-csi/drivers/pkg/csi-common",
-    "github.com/pborman/uuid",
+    "github.com/pkg/errors",
     "golang.org/x/net/context",
     "google.golang.org/grpc/codes",
     "google.golang.org/grpc/status",
     "k8s.io/kubernetes/pkg/util/mount",
-    "k8s.io/utils/exec",
   ]
   solver-name = "gps-cdcl"
   solver-version = 1
