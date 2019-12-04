@@ -21,14 +21,21 @@ import (
 	"github.com/golang/glog"
 
 	"github.com/kubernetes-csi/drivers/pkg/csi-common"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+	clientgokubescheme "k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 )
 
 type driver struct {
 	csiDriver  *csicommon.CSIDriver
 	driverName string
 	endpoint   string
+	kubeClient kubernetes.Interface
 
-	ns  *nodeServer
+	ns *nodeServer
 
 	cap   []*csi.VolumeCapability_AccessMode
 	cscap []*csi.ControllerServiceCapability
@@ -38,13 +45,14 @@ var (
 	version = "0.0.1"
 )
 
-func NewDriver(driverName, nodeID, endpoint string) *driver {
+func NewDriver(driverName, nodeID, endpoint string, kubeClient kubernetes.Interface) *driver {
 	glog.Infof("Driver: %v version: %v", driverName, version)
 
 	d := &driver{
 		driverName: driverName,
-		endpoint: endpoint,
-		csiDriver: csicommon.NewCSIDriver(driverName, version, nodeID),
+		endpoint:   endpoint,
+		csiDriver:  csicommon.NewCSIDriver(driverName, version, nodeID),
+		kubeClient: kubeClient,
 	}
 
 	d.csiDriver.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER})
@@ -58,10 +66,15 @@ func NewDriver(driverName, nodeID, endpoint string) *driver {
 }
 
 func NewNodeServer(d *driver) *nodeServer {
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(glog.Infof)
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: d.kubeClient.CoreV1().Events("")})
+	recorder := eventBroadcaster.NewRecorder(clientgokubescheme.Scheme, corev1.EventSource{Component: d.driverName})
 	return &nodeServer{
 		DefaultNodeServer: csicommon.NewDefaultNodeServer(d.csiDriver),
-		buildah:          &buildah{ driverName: d.driverName, execPath: "/bin/buildah" },
+		buildah:           &buildah{driverName: d.driverName, execPath: "/bin/buildah"},
 		volumeStatuses:    map[string]*volumeStatus{},
+		recorder:          recorder,
 	}
 }
 
@@ -69,7 +82,7 @@ func (d *driver) Run() {
 	s := csicommon.NewNonBlockingGRPCServer()
 	s.Start(d.endpoint,
 		csicommon.NewDefaultIdentityServer(d.csiDriver),
-		csicommon.NewDefaultControllerServer(d.csiDriver),
+		&controllerServer{csicommon.NewDefaultControllerServer(d.csiDriver)},
 		d.ns)
 	s.Wait()
 }

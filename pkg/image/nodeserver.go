@@ -21,6 +21,10 @@ import (
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"strconv"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -35,6 +39,7 @@ type nodeServer struct {
 	*csicommon.DefaultNodeServer
 	driverName     string
 	buildah        *buildah
+	recorder       record.EventRecorder
 	volumeStatuses map[string]*volumeStatus
 }
 
@@ -55,6 +60,15 @@ var (
 	volumePhaseContainerImagePushed volumePhase = "ContainerImagePushed"
 	volumePhaseCnotainerDeleted     volumePhase = "ContainerDeleted"
 	volumePhaseUnPublished          volumePhase = "UnPublished"
+
+	// evnets
+	eventReasonFailed              string = "Failed"
+	eventReasonPullingForVolume    string = "PullingForVolume"
+	eventReasonPulledForVolume     string = "PulledForVolume"
+	eventReasonCommittingForVolume string = "CommittingForVolume"
+	eventReasonCommittedForVolume  string = "CommittedForVolume"
+	eventReasonPushingForVolume    string = "PushingForVolume"
+	eventReasonPushedForVolume     string = "PushedForVolume"
 )
 
 type volumeStatus struct {
@@ -69,6 +83,8 @@ type volumeConfig struct {
 	postPublish       bool
 	postPublishImage  string
 	postPublishSquash bool
+	isEphemeral       bool
+	podMetadata       metav1.ObjectMeta
 }
 
 func (ns *nodeServer) initVolumeStatus(volumeId string, config *volumeConfig) error {
@@ -119,6 +135,10 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if err := ns.publishVolume(ctx, req, volumeId); err != nil {
 		glog.Errorf("publishing volume(%s) failed: %s", volumeId, err.Error())
 		glog.Error("rolling back the publish process")
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volConfig.podMetadata}, corev1.EventTypeNormal,
+			eventReasonFailed, "failed creating volume with image=%s : %s", volConfig.image, err,
+		)
 		if errRollback := ns.rollbackPublishVolume(ctx, req, volumeId); errRollback != nil {
 			glog.Errorf("rolling back publishing volume(%s) process failed: %s", volumeId, err.Error())
 			return nil, status.Error(codes.Internal, err.Error())
@@ -146,9 +166,18 @@ func (ns *nodeServer) publishVolume(ctx context.Context, req *csi.NodePublishVol
 			volStatus.phase = volumePhaseContainerCreated
 			return ns.publishVolume(ctx, req, volumeId)
 		}
+
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+			eventReasonPullingForVolume, "pulling %s", volStatus.config.image,
+		)
 		if err := ns.buildah.from(volumeId, volStatus.config.image, volStatus.config.dockerConfigJson); err != nil {
 			return errors.Wrapf(err, "can't create buildah container(name=%s)", volumeId)
 		}
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+			eventReasonPulledForVolume, "pulled %s", volStatus.config.image,
+		)
 		volStatus.phase = volumePhaseContainerCreated
 		return ns.publishVolume(ctx, req, volumeId)
 	case volumePhaseContainerCreated:
@@ -225,6 +254,14 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 
 	if err := ns.unPublishVolume(ctx, req, volumeId); err != nil {
+		glog.Errorf("unpublishing volume(%s) failed: %s", volumeId, err.Error())
+		volStatus := ns.getVolumeStatus(volumeId)
+		if volStatus != nil {
+			ns.recorder.Eventf(
+				&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+				eventReasonFailed, "failed deleting volume: %s", err,
+			)
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
@@ -250,9 +287,17 @@ func (ns *nodeServer) unPublishVolume(ctx context.Context, req *csi.NodeUnpublis
 			volStatus.phase = volumePhaseContainerImagePushed
 			return ns.unPublishVolume(ctx, req, volumeId)
 		}
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+			eventReasonCommittingForVolume, "committing volume as %s", volStatus.config.postPublishImage,
+		)
 		if err := ns.buildah.commit(req.GetVolumeId(), volStatus.config.postPublishImage, volStatus.config.postPublishSquash); err != nil {
 			return errors.Wrapf(err, "can't commit buildah container(name=%s)", volumeId)
 		}
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+			eventReasonCommittedForVolume, "committed volume as %s", volStatus.config.postPublishImage,
+		)
 		volStatus.phase = volumePhaseContainerCommitted
 		return ns.unPublishVolume(ctx, req, volumeId)
 	case volumePhaseContainerCommitted:
@@ -262,9 +307,17 @@ func (ns *nodeServer) unPublishVolume(ctx context.Context, req *csi.NodeUnpublis
 		volStatus.phase = volumePhaseContainerUnMounted
 		return ns.unPublishVolume(ctx, req, volumeId)
 	case volumePhaseContainerUnMounted:
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+			eventReasonPushingForVolume, "pushing %s", volStatus.config.postPublishImage,
+		)
 		if err := ns.buildah.push(req.GetVolumeId(), volStatus.config.postPublishImage, volStatus.config.dockerConfigJson); err != nil {
 			return errors.Wrapf(err, "can't push image(=%s)", volStatus.config.postPublishImage)
 		}
+		ns.recorder.Eventf(
+			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
+			eventReasonPushedForVolume, "pushed %s", volStatus.config.postPublishImage,
+		)
 		volStatus.phase = volumePhaseContainerImagePushed
 		return ns.unPublishVolume(ctx, req, volumeId)
 	case volumePhaseContainerImagePushed:
@@ -296,6 +349,36 @@ func getVolumeConfig(req *csi.NodePublishVolumeRequest) (*volumeConfig, error) {
 	secrets := req.GetSecrets()
 
 	volumeConfig := &volumeConfig{}
+	podMetadata := &metav1.ObjectMeta{}
+
+	podNamespace, ok := volumeContext["csi.storage.k8s.io/pod.namespace"]
+	if !ok {
+		return nil, errors.New("CSIDriver's spec.podInfoOnMount must be true")
+	}
+	podMetadata.Namespace = podNamespace
+
+	podName, ok := volumeContext["csi.storage.k8s.io/pod.name"]
+	if !ok {
+		return nil, errors.New("CSIDriver's spec.podInfoOnMount must be true")
+	}
+	podMetadata.Name = podName
+
+	podUid, ok := volumeContext["csi.storage.k8s.io/pod.uid"]
+	if !ok {
+		return nil, errors.New("CSIDriver's spec.podInfoOnMount must be true")
+	}
+	podMetadata.UID = types.UID(podUid)
+
+	isEpehemeralStr, ok := volumeContext["csi.storage.k8s.io/ephemeral"]
+	if !ok {
+		return nil, errors.New("csi.storage.k8s.io/ephemeral is missing in volume context")
+	}
+
+	isEphemeral, err := strconv.ParseBool(isEpehemeralStr)
+	if err != nil {
+		return nil, errors.New("csi.storage.k8s.io/ephemeral must be boolean string")
+	}
+	volumeConfig.isEphemeral = isEphemeral
 
 	if len(secrets) > 0 {
 		dockerConfigJson, ok := secrets[".dockerconfigjson"]
@@ -334,4 +417,8 @@ func getVolumeConfig(req *csi.NodePublishVolumeRequest) (*volumeConfig, error) {
 	}
 
 	return volumeConfig, nil
+}
+
+func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "")
 }

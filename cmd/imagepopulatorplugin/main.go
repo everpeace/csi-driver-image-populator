@@ -18,9 +18,12 @@ package main
 
 import (
 	"flag"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"os"
 
 	"github.com/kubernetes-csi/csi-driver-image-populator/pkg/image"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 func init() {
@@ -31,6 +34,8 @@ var (
 	endpoint   = flag.String("endpoint", "unix://tmp/csi.sock", "CSI endpoint")
 	driverName = flag.String("drivername", "image.csi.k8s.io", "name of the driver")
 	nodeID     = flag.String("nodeid", "", "node id")
+	masterURL  = flag.String("masterURL", "", "master url")
+	kubeconfig = flag.String("kubeconfig", "", "kubeconfig path")
 )
 
 func main() {
@@ -41,6 +46,14 @@ func main() {
 }
 
 func handle() {
-	driver := image.NewDriver(*driverName, *nodeID, *endpoint)
+	config, err := clientcmd.BuildConfigFromFlags(*masterURL, *kubeconfig)
+	if err != nil {
+		panic(err.Error())
+	}
+	kubeClient, err := kubernetes.NewForConfig(rest.AddUserAgent(config, "mpi-operator"))
+	if err != nil {
+		panic(err.Error())
+	}
+	driver := image.NewDriver(*driverName, *nodeID, *endpoint, kubeClient)
 	driver.Run()
 }
