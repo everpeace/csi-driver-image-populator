@@ -75,16 +75,18 @@ type volumeStatus struct {
 	config          *volumeConfig
 	phase           volumePhase
 	provisionedRoot string
+	imageToPush     string
 }
 
 type volumeConfig struct {
-	dockerConfigJson  string
-	image             string
-	postPublish       bool
-	postPublishImage  string
-	postPublishSquash bool
-	isEphemeral       bool
-	podMetadata       metav1.ObjectMeta
+	dockerConfigJson             string
+	image                        string
+	postPublish                  bool
+	postPublishImageRepository   string
+	postPublishImageTagGenerator tagGenerator
+	postPublishSquash            bool
+	isEphemeral                  bool
+	podMetadata                  metav1.ObjectMeta
 }
 
 func (ns *nodeServer) initVolumeStatus(volumeId string, config *volumeConfig) error {
@@ -287,16 +289,19 @@ func (ns *nodeServer) unPublishVolume(ctx context.Context, req *csi.NodeUnpublis
 			volStatus.phase = volumePhaseContainerImagePushed
 			return ns.unPublishVolume(ctx, req, volumeId)
 		}
+
+		generatedTag := volStatus.config.postPublishImageTagGenerator.generate()
+		volStatus.imageToPush = fmt.Sprintf("%s:%s", volStatus.config.postPublishImageRepository, generatedTag)
 		ns.recorder.Eventf(
 			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
-			eventReasonCommittingForVolume, "committing volume(volumeId=%s) as image \"%s\"", volumeId, volStatus.config.postPublishImage,
+			eventReasonCommittingForVolume, "committing volume(volumeId=%s) as image \"%s\"", volumeId, volStatus.imageToPush,
 		)
-		if err := ns.buildah.commit(req.GetVolumeId(), volStatus.config.postPublishImage, volStatus.config.postPublishSquash); err != nil {
+		if err := ns.buildah.commit(req.GetVolumeId(), volStatus.imageToPush, volStatus.config.postPublishSquash); err != nil {
 			return errors.Wrapf(err, "can't commit buildah container(name=%s)", volumeId)
 		}
 		ns.recorder.Eventf(
 			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
-			eventReasonCommittedForVolume, "committed volume(volumeId=%s) as image \"%s\"", volumeId, volStatus.config.postPublishImage,
+			eventReasonCommittedForVolume, "committed volume(volumeId=%s) as image \"%s\"", volumeId, volStatus.imageToPush,
 		)
 		volStatus.phase = volumePhaseContainerCommitted
 		return ns.unPublishVolume(ctx, req, volumeId)
@@ -309,14 +314,14 @@ func (ns *nodeServer) unPublishVolume(ctx context.Context, req *csi.NodeUnpublis
 	case volumePhaseContainerUnMounted:
 		ns.recorder.Eventf(
 			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
-			eventReasonPushingForVolume, "pushing image \"%s\"", volStatus.config.postPublishImage,
+			eventReasonPushingForVolume, "pushing image \"%s\"", volStatus.imageToPush,
 		)
-		if err := ns.buildah.push(req.GetVolumeId(), volStatus.config.postPublishImage, volStatus.config.dockerConfigJson); err != nil {
-			return errors.Wrapf(err, "can't push image(=%s)", volStatus.config.postPublishImage)
+		if err := ns.buildah.push(req.GetVolumeId(), volStatus.imageToPush, volStatus.config.dockerConfigJson); err != nil {
+			return errors.Wrapf(err, "can't push image(=%s)", volStatus.imageToPush)
 		}
 		ns.recorder.Eventf(
 			&corev1.Pod{ObjectMeta: volStatus.config.podMetadata}, corev1.EventTypeNormal,
-			eventReasonPushedForVolume, "pushed image \"%s\"", volStatus.config.postPublishImage,
+			eventReasonPushedForVolume, "pushed image \"%s\"", volStatus.imageToPush,
 		)
 		volStatus.phase = volumePhaseContainerImagePushed
 		return ns.unPublishVolume(ctx, req, volumeId)
@@ -401,11 +406,30 @@ func getVolumeConfig(req *csi.NodePublishVolumeRequest) (*volumeConfig, error) {
 		volumeConfig.postPublish = b
 	}
 
-	postPublishImage, ok := volumeContext["post-publish-image"]
+	postPublishImageRepository, ok := volumeContext["post-publish-image-repository"]
 	if volumeConfig.postPublish && !ok {
 		return nil, errors.New("post-publish-image must be specified when post-publish is true")
 	}
-	volumeConfig.postPublishImage = postPublishImage
+	volumeConfig.postPublishImageRepository = postPublishImageRepository
+
+	tagGeneratorTypeRaw, ok := volumeContext["post-publish-image-tag-generator-type"]
+	if !ok {
+		return nil, errors.New("post-publish-image-tag-generator-type must be specified when post-publish is true")
+	}
+
+	tagGeneratorType := tagGeneratorType(tagGeneratorTypeRaw)
+	if tagGeneratorType != tagGeneratorTypeTimestamp && tagGeneratorType != tagGeneratorTypeFixed {
+		return nil, errors.New("post-publish-image-tag-generator-type supports 'timestamp' or 'fixed'")
+	}
+	volumeConfig.postPublishImageTagGenerator.generatorType = tagGeneratorType
+
+	if tagGeneratorType == tagGeneratorTypeFixed {
+		fixedTag, _ := volumeContext["post-publish-image-fixed-tag"]
+		if fixedTag != "" {
+			return nil, errors.New("post-publish-image-fixed-tag must not be empty")
+		}
+		volumeConfig.postPublishImageTagGenerator.fixedTag = fixedTag
+	}
 
 	if postPublishSquash, ok := volumeContext["post-publish-squash"]; ok {
 		b, err := strconv.ParseBool(postPublishSquash)

@@ -22,5 +22,8 @@ spec:
         # example.
         image: busybox
         post-publish: "true"
-        post-publish-image: everpeace/misc:busybox-v2
+        post-publish-image-repository: everpeace/misc
+        post-publish-image-tag-generator-type: timestamp
+#        post-publish-image-tag-generator-type: fixed
+#        post-publish-image-fixed-tag: 20191204-11
         post-publish-squash: "false"
