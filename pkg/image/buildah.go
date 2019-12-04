@@ -104,7 +104,7 @@ func (b *buildah) mount(containerName string) (string, error) {
 func (b *buildah) commit(containerName, image string, squash bool) error {
 	args := []string{"commit"}
 	if squash {
-		args = append(args, "--squash")
+		args = append(args, "--format", "docker", "--squash")
 	}
 	args = append(args, containerName, image)
 
